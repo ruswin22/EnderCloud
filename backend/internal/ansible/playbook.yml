@@ -1,0 +1,126 @@
+---
+- name: Setup and launch Minecraft Server
+  hosts: mc
+  become: true
+  vars:
+    mc_base_dir: /opt/minecraft
+    mc_user: minecraft
+    world_name: "{{ world_name | default('MyWorld') }}"
+    seed: "{{ seed | default('12345') }}"
+    mc_ram: "{{ mc_ram | default('2G') }}"
+    mc_server_jar: "{{ mc_base_dir }}/server.jar"
+
+  tasks:
+    - name: 🧰 Update apt packages
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: ☕ Install Java 21
+      apt:
+        name: openjdk-21-jre-headless
+        state: present
+
+    - name: 👤 Create minecraft user
+      user:
+        name: "{{ mc_user }}"
+        system: yes
+        shell: /bin/bash
+        create_home: yes
+
+    - name: 📁 Create Minecraft directory
+      file:
+        path: "{{ mc_base_dir }}"
+        state: directory
+        owner: "{{ mc_user }}"
+        group: "{{ mc_user }}"
+        mode: '0755'
+
+    - name: 🌐 Get latest Minecraft version manifest
+      uri:
+        url: https://piston-meta.mojang.com/mc/game/version_manifest.json
+        return_content: yes
+      register: version_manifest
+
+    - name: 🌐 Extract latest release version
+      set_fact:
+        latest_version: "{{ version_manifest.json.latest.release }}"
+
+    - name: 🌐 Get version details for latest release
+      uri:
+        url: "{{ version_manifest.json.versions | selectattr('id', 'equalto', latest_version) | map(attribute='url') | first }}"
+        return_content: yes
+      register: latest_version_info
+
+    - name: 🌐 Set Minecraft server JAR URL
+      set_fact:
+        mc_server_jar_url: "{{ latest_version_info.json.downloads.server.url }}"
+
+    - name: 🌐 Download Minecraft server jar
+      get_url:
+        url: "{{ mc_server_jar_url }}"
+        dest: "{{ mc_server_jar }}"
+        mode: '0644'
+        owner: "{{ mc_user }}"
+        group: "{{ mc_user }}"
+      notify: Restart Minecraft
+
+    - name: 📝 Accept EULA
+      copy:
+        dest: "{{ mc_base_dir }}/eula.txt"
+        content: "eula=true\n"
+        owner: "{{ mc_user }}"
+        group: "{{ mc_user }}"
+        mode: '0644'
+
+    - name: ⚙️ Create systemd service for Minecraft
+      copy:
+        dest: /etc/systemd/system/minecraft.service
+        content: |
+          [Unit]
+          Description=Minecraft Server
+          After=network.target
+
+          [Service]
+          WorkingDirectory={{ mc_base_dir }}
+          User={{ mc_user }}
+          Restart=always
+          ExecStart=/usr/bin/java -Xmx{{ mc_ram }} -Xms{{ mc_ram }} -jar {{ mc_server_jar }} nogui
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Minecraft
+
+    - name: 🔄 Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: 🚀 Enable and start Minecraft service (first run)
+      systemd:
+        name: minecraft
+        state: started
+        enabled: yes
+
+    - name: ⏳ Wait for server.properties to be created
+      wait_for:
+        path: "{{ mc_base_dir }}/server.properties"
+        state: present
+        delay: 10
+        timeout: 60
+
+    - name: ⚙️ Set Minecraft server to offline mode
+      lineinfile:
+        path: "{{ mc_base_dir }}/server.properties"
+        regexp: '^online-mode='
+        line: 'online-mode=false'
+        create: yes
+        owner: "{{ mc_user }}"
+        group: "{{ mc_user }}"
+        mode: '0644'
+      notify: Restart Minecraft
+
+  handlers:
+    - name: Restart Minecraft
+      systemd:
+        name: minecraft
+        state: restarted
